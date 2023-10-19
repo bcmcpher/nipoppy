@@ -6,21 +6,153 @@ import json
 import subprocess
 import tempfile
 import re
-    
+
 import numpy as np
+# from scipy import stats  ## for mode operation?
+
 import nibabel as nib
 from bids import BIDSLayout, BIDSLayoutIndexer
 
 import nipoppy.workflow.logger as my_logger
 
-#Author: bcmcpher
-#Date: 15-Jun-2023
+# Author: bcmcpher
+# Date: 15-Jun-2023
 fname = __file__
 CWD = os.path.dirname(os.path.abspath(fname))
 
 # env vars relative to the container.
 
 MEM_MB = 4000
+
+
+def max_lmax(ndirs):
+
+    if ndirs <= 0:
+        raise ValueError('A positive number of directions must be passed.')
+
+    # get continuous (odd and even) harmonic order
+    cmax = int(np.floor((-3 + np.sqrt(1 + 8 * ndirs)) / 2.0))
+
+    # force an even harmonic order
+    if cmax % 2 == 1:
+        return (cmax - 1)
+    else:
+        return (cmax)
+
+
+def bval_bvec_data(bval, bvec, zeroThr=45):
+
+    # call the function that rounds bvals
+    rval = shell_bvals(bval, thr=zeroThr)
+
+    # get the "theoretical" data lmax based on directions regardless of shell
+    dlmax = max_lmax(bvec[:, rval > 0].shape[1])
+
+    if len(np.unique(rval)) > 2:
+
+        logger.info(f"Multishell data has shells b = {bunq[1:]}")
+        mlmax = []
+        mldir = []
+        for shell in bunq[1:]:
+
+            # pull the shells
+            tndir = rval == shell
+            # b0idx = rval == 0
+
+            # check that directed vectors are unique
+            tvec = bvec[:, tndir]
+            tdir = np.unique(tvec, axis=0)
+            mldir.append(tdir.shape[1])
+
+            # compute and print the maximum lmax per shell
+            tlmax = max_lmax(tdir.shape[1])
+            mlmax.append(tlmax)
+            logger.info(f" -- Shell b = {int(shell)} has {tdir.shape[1]} directions capable of a max lmax: {tlmax}")
+
+            # the max lmax within any 1 shell is used
+            plmax = max(mlmax)
+            logger.info(f"The maximum lmax for any one shell is: {plmax}")
+
+        else:
+
+            plmax = max_lmax(np.sum(rval[rval > 0].shape[0]))
+
+        return (dten, plmax)
+
+
+def default_tensor_shell(bval):
+    # use bvec to check that IDd bval has at least 6 directions for tensor fitting
+    return (bval[np.abs(bval - 1000) == np.min(np.abs(bval - 1000))][0])
+
+# bval = np.array([0, 5, 45, 1000, 1005, 995, 1005, 995, 2000, 2005, 2005, 1995, 3000, 3000, 3000, 4000, 4005, 3995])
+# bval = np.array([0, 0, 0, 650, 650, 650, 600, 650, 1250, 1250, 1250, 1250, 1250, 1250, 3000, 3000, 3000, 3000])
+
+
+def shell_bvals(bval, thr=45, tol=50):
+
+    # clustering around "centers" that get rounded?
+    # from sklearn.cluster import MeanShift, estimate_bandwidth
+    # X = np.array(zip(x,np.zeros(len(x))), dtype=np.int)
+    # bandwidth = estimate_bandwidth(X, quantile=0.1)
+    # ms = MeanShift(bandwidth=bandwidth, bin_seeding=True)
+    # ms.fit(X)
+    # labels = ms.labels_
+    # cluster_centers = ms.cluster_centers_
+
+    # sort them
+    sval = np.sort(bval)
+
+    # zero values below threshold
+    sval[sval <= thr] = 0
+
+    # indices into sorted values where change bigger than tolerance occurs
+    bidx = np.where(np.diff(sval) > tol)[0] + 1
+
+    # get the values that exist w/in each shell
+    shell = np.split(sval, bidx)
+
+    # np array of the corrected / rounded values
+    fixed = np.asarray([np.mean(np.round((x) / 10) * 10) for x in shell])
+
+    # create a vector of the "effective" bvals
+    bout = fixed[abs(bval[None, :] - fixed[:, None]).argmin(axis=0)]
+    # these won't be passed, but used to determine shell labels / features
+
+    # return shelled bvals
+    return (bout)
+
+
+class BIDSdwi():
+
+    def __init__(self, dwi, layout):
+
+        self.dwi = dwi
+        self.dwi_full = dwi.path
+        self.dwi_file = dwi.filename
+        self.dwi_path = dwi.dirname
+        self.json = layout.get_metadata(dwi)
+
+        if layout.get_bval(dwi):
+            self.bval = layout.get_bval(dwi)
+        else:
+            self.bval = None
+
+        if layout.get_bvec(dwi):
+            self.bvec = layout.get_bvec(dwi)
+        else:
+            self.bvec = None
+
+        # load row from participants.tsv?
+        # self.part =
+
+        # do all the max lmax / shell checks within this?
+
+    def get_bval(self):
+        return (self.bval)
+
+    def get_bvec(self):
+        return (self.bvec)
+
 
 def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_filter=False, logger=None):
     """ Parse and verify the input files to build TractoFlow's simplified input to avoid their custom BIDS filter
@@ -29,12 +161,48 @@ def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_fi
     ## load from global configs
     DATASET_ROOT = global_configs["DATASET_ROOT"]
 
+    ## load the bids filter if it's called
+    if use_bids_filter:
+
+        ## path to where pipeline specific filters _should_ be
+        bidf_path = Path(f"{DATASET_ROOT}", 'proc', 'bids_filter_tractoflow.json') 
+        ## can change to a path to load an arbitrary filter
+
+        ## if a filter exists
+        if os.path.exists(bidf_path):
+            logger.info(' -- Expected bids_filter.json is found.')
+            f = open(bidf_path)
+            bidf = json.load(f) ## load the json as a dictionary
+            f.close()
+            ## validate that the dictionary has valid (or at least expected) fields in it
+            ## validated dictionary fields can be parsed for more complete ignore flags below
+            
+        else:
+            logger.info(' -- Expected bids_filter.json is not found.')
+            bidf = {} ## make it empty
+            
+    else:
+        logger.info(' -- Not using a bids_filter.json')
+
     ## because why parse subject ID the same as bids ID?
     subj = participant_id.replace('sub-', '')
 
     ## build a regex of anything not subject id
     srx = re.compile(f"sub-(?!{subj}.*$)")
 
+    ## from mriqc parsing
+    # ignore_paths = [
+    #     # Ignore folders at the top if they don't start with /sub-<label>/
+    #     re.compile(r"^(?!/sub-[a-zA-Z0-9]+)"),
+    #     # Ignore all modality subfolders, except for func/ or anat/
+    #     re.compile(
+    #         r"^/sub-[a-zA-Z0-9]+(/ses-[a-zA-Z0-9]+)?/"
+    #         r"(beh|fmap|pet|perf|meg|eeg|ieeg|micr|nirs)"
+    #     ),
+    #     # Ignore all files, except for the supported modalities
+    #     re.compile(r"^.+(?<!(_T1w|_T2w|bold|_dwi))\.(json|nii|nii\.gz)$"),
+    # ]
+    
     logger.info('Building Single Subject BIDS Layout...')
 
     ## build a BIDSLayoutIndexer to only pull subject ID
@@ -45,28 +213,6 @@ def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_fi
     ## check if DB exists on disk first? BIDSLayout(database_path=var)? where is this saved?
     ## should this be made / updated as part of BIDS-ification of dicoms?
 
-    ## load the bids filter if it's called
-    if use_bids_filter:
-
-        bidf_path = Path(f"{DATASET_ROOT}", 'proc', 'bids_filter_tractoflow.json') ## is this where it will always be?
-        ## or does this need to turn into a path to a filter to load?
-
-        ## if a filter exists
-        if os.path.exists(bidf_path):
-            logger.info(' -- Expected bids_filter.json is found.')
-            f = open(bidf_path)
-            bidf = json.load(f) ## load the json as a dictionary
-            f.close()
-            ## does this validate the dictionary in any way?
-            ## https://github.com/nipreps/fmriprep/blob/20659650be367dff78f5e8c91c1856d4df7fcd4b/fmriprep/cli/parser.py#L72-L91
-    
-        else:
-            logger.info(' -- Expected bids_filter.json is not found.')
-            bidf = {} ## make it empty
-            
-    else:
-        logger.info(' -- Not using a bids_filter.json')
-
     ## pull every t1w / dwi file name from BIDS layout
     if bidf:
         anat_files = layout.get(extension='.nii.gz', **bidf['t1w'])
@@ -74,7 +220,7 @@ def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_fi
     else:
         anat_files = layout.get(suffix='T1w', extension='.nii.gz')
         dmri_files = layout.get(suffix='dwi', extension='.nii.gz')
-
+        
     ## preallocate candidate anatomical files
     canat = []
 
@@ -85,7 +231,10 @@ def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_fi
         tmeta = anat.get_metadata()
         tvol = anat.get_image()
 
-        ## because PPMI doesn't have full sidecars
+        ## what features of a T1 are most important to log when the goal is process w/ dMRI?
+        ## Smaller / Larger image dim? Compute a basic QC/SNR feature?
+        
+        ## because PPMI doesn't have full sidecars, pull stuff
         
         try:
             tmcmode = tmeta['MatrixCoilMode']
@@ -178,7 +327,9 @@ def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_fi
         ## build paths to bvec / bval data
         tbvec = Path(bids_dir, participant_id, 'ses-' + session_id, 'dwi', dmri.filename.replace('.nii.gz', '.bvec')).joinpath()
         tbval = Path(bids_dir, participant_id, 'ses-' + session_id, 'dwi', dmri.filename.replace('.nii.gz', '.bval')).joinpath()
-
+        #tbval = layout.get_bval(dmri)
+        #tbvec = layout.get_bvec(dmri)
+        
         ## if bvec / bval data exist
         if os.path.exists(tbvec) & os.path.exists(tbval):
             logger.info('BVEC / BVAL data exists for this file')
@@ -244,7 +395,7 @@ def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_fi
             if (dmrifs1pe == dmrifs2pe):
 
                 ## print log for surprising situation of matching files
-                logger.info('Sequences are not reverse encoded and are identifcal.')
+                logger.info('Sequences are not reverse encoded and are identical.')
                 logger.info('Was the phase encoding not flipped during acquisition or are these sequences longitudinal?')
                 logger.info('Unsure how to parse. Ignoring shorter (or second) sequence.')
 
@@ -559,7 +710,7 @@ def run(participant_id, global_configs, session_id, output_dir, use_bids_filter,
     tdir = np.unique(tvec, axis=0)
     
     ## compute and print the maximum shell
-    dlmax = int(np.floor((-3 + np.sqrt(1 + 8 * tdir.shape[1]) / 2.0)))
+    dlmax = max_lmax(tdir.shape[1])
     logger.info(f'The largest supported lmax is: {dlmax}')
     logger.info(f' -- The largest possible lmax is generally determined by the number of values in each shell.')
     
@@ -597,7 +748,7 @@ def run(participant_id, global_configs, session_id, output_dir, use_bids_filter,
             mldir.append(tdir.shape[1])
             
             ## compute and print the maximum lmax per shell
-            tlmax = int(np.floor((-3 + np.sqrt(1 + 8 * tdir.shape[1]) / 2.0)))
+            tlmax = max_lmax(tdir.shape[1])
             mlmax.append(tlmax)
             logger.info(f" -- Shell b = {int(shell)} has {tdir.shape[1]} directions capable of a max lmax: {tlmax}")
 
@@ -662,7 +813,7 @@ def run(participant_id, global_configs, session_id, output_dir, use_bids_filter,
     ## there's probably a better way to try / catch the .run() call here
     try:
         logger.info('Attempting Run')
-        tractoflow_proc = subprocess.run(CMD, shell=True)
+        #tractoflow_proc = subprocess.run(CMD, shell=True)
     except Exception as e:
         logger.error(f"TractoFlow run failed to launch with exception: {e}")
 
