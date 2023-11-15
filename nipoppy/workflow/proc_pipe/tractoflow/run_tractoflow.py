@@ -97,8 +97,22 @@ class BIDSSubjectSession:
         else:
             return self.layout.get(suffix=suffix)
 
+    def get_modality_volumes(self, suffix):
 
+        if self.bids_filter:
+            return self.layout.get(**self.bids_filter[suffix], extension=".nii.gz")
+        else:
+            return self.layout.get(suffix=suffix, extension=".nii.gz")
 
+    def get_dwi_files(self):
+
+        dwi_files = self.get_modality_volumes("dwi")
+
+        dwif = []
+        for dwi in dwi_files:
+            dwif.append(BIDSdwi(dwi, self.layout))
+
+        return dwif
 
 
 
@@ -227,9 +241,12 @@ class BIDSdwi():
             self.bvec_file = None
             self.bvec = None
 
+        # determine if the file is "directed" or not
+        # use values of file, not just that it exists / is not None
+
         # load the data itself into the object
-        self.dwi = nib.load(dwi)
         self.json = dwi.get_metadata()
+        self.dwi = nib.load(dwi)
 
         # check file dimension
         if len(self.dwi.shape) == 4:
@@ -237,7 +254,7 @@ class BIDSdwi():
         elif len(self.dwi.shape) == 3:
             self.nvol = 1
         else:
-            raise ValueError("The DWI file is not a valid dimension.")
+            raise ValueError("The DWI file does not have valid dimension(s): {self.dwi.shape}")
 
         # basic validity check of the loaded data
         if self.bval.shape[0] != self.bvec.shape[1]:
@@ -254,7 +271,7 @@ class BIDSdwi():
 
     @property
     def nshell(self):
-        return len(np.unique(self.bval)[1:])
+        return len(np.unique(self.bval))
 
     @property
     def phaseEncoding(self):
@@ -293,6 +310,9 @@ class BIDSdwi():
     def readout(self):
         return self.json["TotalReadoutTime"]
 
+    @property
+    def nb0s(self):
+        return len(self.bval[self.bval < self.b0thr])
 
 def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_filter=False, logger=None):
     """ Parse and verify the input files to build TractoFlow's simplified input to avoid their custom BIDS filter
@@ -342,12 +362,12 @@ def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_fi
     #     # Ignore all files, except for the supported modalities
     #     re.compile(r"^.+(?<!(_T1w|_T2w|bold|_dwi))\.(json|nii|nii\.gz)$"),
     # ]
-    
+
     logger.info('Building Single Subject BIDS Layout...')
 
     ## build a BIDSLayoutIndexer to only pull subject ID
     bidx = BIDSLayoutIndexer(ignore=[srx])
-    
+
     ## parse bids directory with subject filter
     layout = BIDSLayout(bids_dir, indexer=bidx)
     ## check if DB exists on disk first? BIDSLayout(database_path=var)? where is this saved?
@@ -360,7 +380,7 @@ def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_fi
     else:
         anat_files = layout.get(suffix='T1w', extension='.nii.gz')
         dmri_files = layout.get(suffix='dwi', extension='.nii.gz')
-        
+
     ## preallocate candidate anatomical files
     canat = []
 
@@ -373,9 +393,9 @@ def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_fi
 
         ## what features of a T1 are most important to log when the goal is process w/ dMRI?
         ## Smaller / Larger image dim? Compute a basic QC/SNR feature?
-        
+
         ## because PPMI doesn't have full sidecars, pull stuff
-        
+
         try:
             tmcmode = tmeta['MatrixCoilMode']
         except:
@@ -390,7 +410,7 @@ def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_fi
             tprotocol = tmeta['ProtocolName']
         except:
             tprotocol = 'unknown'
-            
+
         logger.info("- "*25)
         logger.info(anat.filename)
         logger.info(f"Scan Type: {tmcmode}")
