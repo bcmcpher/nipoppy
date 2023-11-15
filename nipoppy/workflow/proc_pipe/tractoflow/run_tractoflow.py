@@ -25,7 +25,84 @@ CWD = os.path.dirname(os.path.abspath(fname))
 MEM_MB = 4000
 
 
-def max_lmax(ndirs):
+class BIDSSubjectSession:
+
+    def __init__(self, global_configs, bids_dir, participant_id, session_id, use_bids_filter=False, logger=None):
+
+        self.configs = global_configs
+        self.bids_dir = bids_dir
+        self.participant_id = participant_id
+        self.session_id = session_id
+
+        # load from global configs
+        DATASET_ROOT = global_configs["DATASET_ROOT"]
+
+        # load the bids filter if it's called
+        if use_bids_filter:
+
+            # path to where pipeline specific filters _should_ be
+            bidf_path = Path(f"{DATASET_ROOT}", 'proc', 'bids_filter_tractoflow.json')
+            # can change to a path to load an arbitrary filter
+
+            # if a filter exists
+            if os.path.exists(bidf_path):
+                logger.info(' -- Expected bids_filter.json is found.')
+                f = open(bidf_path)
+                self.bids_filter = json.load(f)  # load the json as a dictionary
+                f.close()
+                # validate that the dictionary has valid (or at least expected) fields in it
+                # validated dictionary fields can be parsed for more complete ignore flags below
+
+            else:
+                logger.info(' -- Expected bids_filter.json is not found.')
+                self.bids_filter = {}  # make it empty
+
+        else:
+            logger.info(' -- Not using a bids_filter.json')
+
+        # because why parse subject ID the same as bids ID?
+        subj = participant_id.replace('sub-', '')
+        self.subj = subj
+
+        # build a regex of anything not subject id
+        srx = re.compile(f"sub-(?!{subj}.*$)")
+
+        # # from mriqc parsing
+        # ignore_paths = [
+        #     # Ignore folders at the top if they don't start with /sub-<label>/
+        #     re.compile(r"^(?!/sub-[a-zA-Z0-9]+)"),
+        #     # Ignore all modality subfolders, except for func/ or anat/
+        #     re.compile(
+        #         r"^/sub-[a-zA-Z0-9]+(/ses-[a-zA-Z0-9]+)?/"
+        #         r"(beh|fmap|pet|perf|meg|eeg|ieeg|micr|nirs)"
+        #     ),
+        #     # Ignore all files, except for the supported modalities
+        #     re.compile(r"^.+(?<!(_T1w|_T2w|bold|_dwi))\.(json|nii|nii\.gz)$"),
+        # ]
+
+        logger.info('Building Single Subject BIDS Layout...')
+
+        # build a BIDSLayoutIndexer to only pull subject ID
+        bidx = BIDSLayoutIndexer(ignore=[srx])
+
+        # parse bids directory with subject filter
+        self.layout = BIDSLayout(bids_dir, indexer=bidx)
+        # check if DB exists on disk first? BIDSLayout(database_path=var)? where is this saved?
+        # should this be made / updated as part of BIDS-ification of dicoms?
+
+    def get_modality(self, suffix):
+
+        if self.bids_filter:
+            return self.layout.get(**self.bids_filter[suffix])
+        else:
+            return self.layout.get(suffix=suffix)
+
+
+
+
+
+
+def max_lmax(ndirs, logger):
 
     if ndirs <= 0:
         raise ValueError('A positive number of directions must be passed.')
@@ -40,13 +117,17 @@ def max_lmax(ndirs):
         return (cmax)
 
 
-def bval_bvec_data(bval, bvec, zeroThr=45):
+def bval_bvec_data(bval, bvec, logger, zeroThr=45):
 
     # call the function that rounds bvals
     rval = shell_bvals(bval, thr=zeroThr)
 
+    # get the unique non-zero values
+    bunq = np.unique(rval)[1:]
+
     # get the "theoretical" data lmax based on directions regardless of shell
     dlmax = max_lmax(bvec[:, rval > 0].shape[1])
+    logger.info(f"The highest theoretical lmax in the data is {dlmax}")
 
     if len(np.unique(rval)) > 2:
 
@@ -83,9 +164,6 @@ def bval_bvec_data(bval, bvec, zeroThr=45):
 def default_tensor_shell(bval):
     # use bvec to check that IDd bval has at least 6 directions for tensor fitting
     return (bval[np.abs(bval - 1000) == np.min(np.abs(bval - 1000))][0])
-
-# bval = np.array([0, 5, 45, 1000, 1005, 995, 1005, 995, 2000, 2005, 2005, 1995, 3000, 3000, 3000, 4000, 4005, 3995])
-# bval = np.array([0, 0, 0, 650, 650, 650, 600, 650, 1250, 1250, 1250, 1250, 1250, 1250, 3000, 3000, 3000, 3000])
 
 
 def shell_bvals(bval, thr=45, tol=50):
@@ -124,34 +202,96 @@ def shell_bvals(bval, thr=45, tol=50):
 
 class BIDSdwi():
 
-    def __init__(self, dwi, layout):
+    def __init__(self, dwi, layout, b0thr=45, stol=50):
 
-        self.dwi = dwi
-        self.dwi_full = dwi.path
-        self.dwi_file = dwi.filename
+        # paths to the file
+        self.dwi_file = dwi.path
         self.dwi_path = dwi.dirname
-        self.json = layout.get_metadata(dwi)
+        # self.dwi_stem = dwi.filename
 
+        self.b0thr = b0thr
+        self.stol = stol
+
+        # attempt to set direction data
         if layout.get_bval(dwi):
-            self.bval = layout.get_bval(dwi)
+            self.bval_file = layout.get_bval(dwi)
+            self.bval = np.loadtxt(self.bval_file)
         else:
+            self.bval_file = None
             self.bval = None
 
         if layout.get_bvec(dwi):
-            self.bvec = layout.get_bvec(dwi)
+            self.bvec_file = layout.get_bvec(dwi)
+            self.bvec = np.loadtxt(self.bvec_file)
         else:
+            self.bvec_file = None
             self.bvec = None
 
-        # load row from participants.tsv?
-        # self.part =
+        # load the data itself into the object
+        self.dwi = nib.load(dwi)
+        self.json = dwi.get_metadata()
 
-        # do all the max lmax / shell checks within this?
+        # check file dimension
+        if len(self.dwi.shape) == 4:
+            self.nvol = self.dwi.shape[-1]
+        elif len(self.dwi.shape) == 3:
+            self.nvol = 1
+        else:
+            raise ValueError("The DWI file is not a valid dimension.")
 
-    def get_bval(self):
-        return (self.bval)
+        # basic validity check of the loaded data
+        if self.bval.shape[0] != self.bvec.shape[1]:
+            raise ValueError("The dimensions of the bval and bvec file do not match.")
+        else:
+            if self.bval.shape[0] != self.nvol:
+                raise ValueError("The dimensions of the bval/bvec file do not match the image.")
+            else:
+                print("All data is shaped as expected.")
 
-    def get_bvec(self):
-        return (self.bvec)
+    @property
+    def shells(self):
+        return np.unique(self.bval)
+
+    @property
+    def nshell(self):
+        return len(np.unique(self.bval)[1:])
+
+    @property
+    def phaseEncoding(self):
+        return self.json["PhaseEncodingDirection"]
+
+    @property
+    def phaseEncodingAxis(self):
+        if ("i" in self.phaseEncoding):
+            return "x"
+        if ("j" in self.phaseEncoding):
+            return "y"
+        if ("k" in self.phaseEncoding):
+            print("This is probably an error.")
+            return "z"
+
+    @property
+    def shape(self):
+        return self.dwi.shape
+
+    @property
+    def weighted(self):
+        if (self.bval is not None) & (self.bvec is not None):
+            return True
+        else:
+            return False
+
+    @property
+    def ndirs(self):
+        return len(self.bval[self.bval > self.b0thr])
+
+    @property
+    def udirs(self):
+        return np.unique(self.bvec[:, self.bval > self.b0thr], axis=0).shape[1]
+
+    @property
+    def readout(self):
+        return self.json["TotalReadoutTime"]
 
 
 def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_filter=False, logger=None):
