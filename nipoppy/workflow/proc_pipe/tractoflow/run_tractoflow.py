@@ -6,6 +6,7 @@ import json
 import subprocess
 import tempfile
 import re
+import warnings
 
 import numpy as np
 # from scipy import stats  ## for mode operation?
@@ -115,20 +116,26 @@ class BIDSSubjectSession:
         return dwif
 
 
+def max_lmax(ndirs, symmetric=True):
 
-def max_lmax(ndirs, logger):
-
-    if ndirs <= 0:
+    # sanity check inputs
+    if ndirs < 6:
+        warnings.warn("There are not enough directions to model a tensor.")
+    elif ndirs <= 0:
         raise ValueError('A positive number of directions must be passed.')
 
     # get continuous (odd and even) harmonic order
-    cmax = int(np.floor((-3 + np.sqrt(1 + 8 * ndirs)) / 2.0))
+    lmax = int(np.floor((-3 + np.sqrt(1 + 8 * ndirs)) / 2.0))
 
-    # force an even harmonic order
-    if cmax % 2 == 1:
-        return (cmax - 1)
-    else:
-        return (cmax)
+    # if harmonic order is forced to be even (symmetric)
+    if symmetric:
+
+        # force an even harmonic order
+        if lmax % 2 == 1:
+            return (lmax - 1)
+
+    # otherwise return the even harmonic order
+    return (lmax)
 
 
 def bval_bvec_data(bval, bvec, logger, zeroThr=45):
@@ -139,7 +146,7 @@ def bval_bvec_data(bval, bvec, logger, zeroThr=45):
     # get the unique non-zero values
     bunq = np.unique(rval)[1:]
 
-    # get the "theoretical" data lmax based on directions regardless of shell
+    # get the "theoretical" data lmax based on directions regardless of shell(s)
     dlmax = max_lmax(bvec[:, rval > 0].shape[1])
     logger.info(f"The highest theoretical lmax in the data is {dlmax}")
 
@@ -175,9 +182,34 @@ def bval_bvec_data(bval, bvec, logger, zeroThr=45):
         return (dten, plmax)
 
 
-def default_tensor_shell(bval):
-    # use bvec to check that IDd bval has at least 6 directions for tensor fitting
-    return (bval[np.abs(bval - 1000) == np.min(np.abs(bval - 1000))][0])
+def default_tensor_shell(bval, bvec, tshell=1000):
+
+    # set up unique shell valuse and set output shell to None
+    ushell = np.unique(bval)
+    oshell = None
+
+    # while valid output shell not found
+    while oshell is None:
+
+        # safety valve if all shells in input are not sufficient
+        if len(ushell) == 0:
+            raise ValueError("All candidate shells removed.")
+
+        # find the closest shell to target
+        cshell = ushell[np.abs(ushell - tshell) == np.min(np.abs(ushell - tshell))]
+
+        # if the closest shell doesn't have enough directions
+        if bvec[:, bval == cshell].shape[1] < 6:
+
+            # remove it from ushell so loop can try again
+            ushell = np.delete(ushell, np.where(ushell == cshell))
+
+        else:
+
+            # set the output
+            oshell = cshell
+
+    return oshell
 
 
 def shell_bvals(bval, thr=45, tol=50):
@@ -218,35 +250,109 @@ class BIDSdwi():
 
     def __init__(self, dwi, layout, b0thr=45, stol=50):
 
-        # paths to the file
-        self.dwi_file = dwi.path
-        self.dwi_path = dwi.dirname
-        # self.dwi_stem = dwi.filename
-
+        # store the default thresholds
         self.b0thr = b0thr
         self.stol = stol
 
+        # set some default properties
+        self.directed = False
+        self.dir_ref = False
+        self.b0s = False
+
+        # paths to the files and filename
+        self.dwi_path = dwi.dirname
+        self.dwi_file = dwi.path
+
+        # pull the bval / bvec files
+        cbval = layout.get_bval()
+        cbvec = layout.get_bvec()
+
         # attempt to set direction data
-        if layout.get_bval(dwi):
-            self.bval_file = layout.get_bval(dwi)
-            self.bval = np.loadtxt(self.bval_file)
+
+        # if bval file exists
+        if cbval:
+
+            # set the file
+            self.bval_file = cbval
+
+            # try and load the values, fail w/ error
+            try:
+                self.bval = np.loadtxt(self.bval_file)
+            except ValueError:
+                raise ValueError("bval file unable to be read.")
+
+        # otherwise set as empty
         else:
             self.bval_file = None
             self.bval = None
 
-        if layout.get_bvec(dwi):
-            self.bvec_file = layout.get_bvec(dwi)
-            self.bvec = np.loadtxt(self.bvec_file)
+        # if bvec file exists
+        if cbvec:
+
+            # set the file
+            self.bvec_file = cbvec
+
+            # try and load the file, fail w/ error
+            try:
+                self.bvec = np.loadtxt(self.bvec_file)
+            except ValueError:
+                raise ValueError("bvec file unable to be read.")
+
+        # otherwise set as empty
         else:
             self.bvec_file = None
             self.bvec = None
 
         # determine if the file is "directed" or not
-        # use values of file, not just that it exists / is not None
+
+        # if bval / bvec exists
+        if (self.bval is not None) & (self.bvec is not None):
+
+            # if there are any non-zero directions
+            if any(self.bval > b0thr):
+
+                # if there is at least a tensor model worth of directed info
+                if np.unique(self.bvec[:, self.bval > b0thr]).shape[1] >= 6:
+
+                    # it is directed
+                    self.directed = True
+
+                else:
+
+                    # if there's exactly 3, it's probably reference directions
+                    # i.e. shell weighting on (x, y, z) axes w/ b0s
+                    if np.unique(self.bvec[:, self.bval > b0thr]).shape[1] == 3:
+                        self.dir_ref = True
+
+                    # it's still not "directed", but it's more than empty
+                    self.directed = False
+                    self.b0s = True
+
+            else:
+
+                # bval is all 0
+                self.directed = False
+                self.b0s = True
+
+        else:
+
+            # there's no bval / bval files
+            self.directed = False
+            self.b0s = True
 
         # load the data itself into the object
+        self.json_file = self.dwi_file.replace(".nii.gz", ".json")
+        # probably a better way to get the sidecar path than this...
         self.json = dwi.get_metadata()
-        self.dwi = nib.load(dwi)
+
+        # inspect the image volume
+        try:
+            self.dwi = nib.load(dwi)
+        except ValueError:
+            raise ValueError("DWI file is not a valid nifti object.")
+
+        # check image affine
+        # check voxel iso
 
         # check file dimension
         if len(self.dwi.shape) == 4:
@@ -263,7 +369,7 @@ class BIDSdwi():
             if self.bval.shape[0] != self.nvol:
                 raise ValueError("The dimensions of the bval/bvec file do not match the image.")
             else:
-                print("All data is shaped as expected.")
+                print("All data has matching dimensions.")
 
     @property
     def shells(self):
@@ -271,14 +377,36 @@ class BIDSdwi():
 
     @property
     def nshell(self):
-        return len(np.unique(self.bval))
+        return len(self.shells)
 
     @property
     def phaseEncoding(self):
         return self.json["PhaseEncodingDirection"]
 
     @property
-    def phaseEncodingAxis(self):
+    def shape(self):
+        return self.dwi.shape
+
+    @property
+    def ndirs(self):
+        return self.bval[self.bval > self.b0thr].shape[0]
+
+    @property
+    def udirs(self):
+        return np.unique(self.bvec[:, self.bval > self.b0thr], axis=1)
+
+    @property
+    def readout(self):
+        return self.json["TotalReadoutTime"]
+
+    @property
+    def nb0s(self):
+        return self.bval[self.bval < self.b0thr].shape[0]
+
+    def get_phaseEncoding(self, notation="letters", directed=True):
+
+        # i/j/k to x/y/z to LR/AP/SI
+
         if ("i" in self.phaseEncoding):
             return "x"
         if ("j" in self.phaseEncoding):
@@ -287,32 +415,6 @@ class BIDSdwi():
             print("This is probably an error.")
             return "z"
 
-    @property
-    def shape(self):
-        return self.dwi.shape
-
-    @property
-    def weighted(self):
-        if (self.bval is not None) & (self.bvec is not None):
-            return True
-        else:
-            return False
-
-    @property
-    def ndirs(self):
-        return len(self.bval[self.bval > self.b0thr])
-
-    @property
-    def udirs(self):
-        return np.unique(self.bvec[:, self.bval > self.b0thr], axis=0).shape[1]
-
-    @property
-    def readout(self):
-        return self.json["TotalReadoutTime"]
-
-    @property
-    def nb0s(self):
-        return len(self.bval[self.bval < self.b0thr])
 
 def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_filter=False, logger=None):
     """ Parse and verify the input files to build TractoFlow's simplified input to avoid their custom BIDS filter
