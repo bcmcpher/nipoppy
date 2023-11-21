@@ -138,26 +138,30 @@ def max_lmax(ndirs, symmetric=True):
     return (lmax)
 
 
-def bval_bvec_data(bval, bvec, b0thr=45):
+def bval_bvec_data(bval, bvec, b0thr=45, stol=49, tshell=1000, symmetric=True):
 
     # call the function that rounds bvals
-    rval = shell_bvals(bval, b0thr=b0thr)
+    rval = shell_bvals(bval, b0thr=b0thr, stol=stol)
 
     # get the unique non-zero values
     bunq = np.unique(rval)
 
     # get the default tensor shell
-    dten = default_tensor_shell(bval, bvec)
+    dten = default_tensor_shell(bval, bvec, tshell)
 
     # get the "theoretical" data lmax based on directions regardless of shell(s)
-    dlmax = max_lmax(bvec[:, rval > 0].shape[1])
-    print(f"The highest theoretical lmax in the data is {dlmax}")
+    dlmax = max_lmax(bvec[:, rval > 0].shape[1], symmetric)
 
+    # if the data is multishell
     if len(np.unique(rval)) > 2:
 
         print(f"Multishell data has shells b = {bunq[1:]}")
+
+        # preallocate lists for by-shell values
         mlmax = []
         mldir = []
+
+        # for every non-zero shell
         for shell in bunq[1:]:
 
             # pull the shells
@@ -166,23 +170,36 @@ def bval_bvec_data(bval, bvec, b0thr=45):
 
             # check that directed vectors are unique
             tvec = bvec[:, tndir]
-            tdir = np.unique(tvec, axis=0)
+            tdir = np.unique(tvec, axis=0)  # this needs a better tolerance
             mldir.append(tdir.shape[1])
 
             # compute and print the maximum lmax per shell
-            tlmax = max_lmax(tdir.shape[1])
+            tlmax = max_lmax(tdir.shape[1], symmetric)
             mlmax.append(tlmax)
             print(f" -- Shell b = {int(shell)} has {tdir.shape[1]} directions capable of a max lmax: {tlmax}")
 
-        else:
-
-            plmax = max_lmax(np.sum(rval[rval > 0].shape[0]))
-
-            # the max lmax within any 1 shell is used
+        # get the highest possible shell
         plmax = max(mlmax)
+
+        print(f"The highest theoretical lmax in the data is: {dlmax}")
         print(f"The maximum lmax for any one shell is: {plmax}")
 
-        return (dten, plmax)
+    # if the data is single shell
+    else:
+
+        # pull the values for the single shell
+        shell = bunq[1]
+        tndir = rval == shell
+        tvec = bvec[:, tndir]
+        tdir = np.unique(tvec, axis=0)
+        plmax = dlmax
+
+        # print an equivalent output
+        print(f"Single shell data has shell b = {int(shell)}")
+        print(f" -- Shell b = {int(shell)} has {tdir.shape[1]} directions capable of a max lmax: {plmax}")
+        print(f"The maximum lmax for the data is: {plamx}")
+
+    return (plmax, dlmax, dten)
 
 
 def default_tensor_shell(bval, bvec, tshell=1000):
@@ -207,6 +224,7 @@ def default_tensor_shell(bval, bvec, tshell=1000):
             # remove it from ushell so loop can try again
             ushell = np.delete(ushell, np.where(ushell == cshell))
 
+        # otherwise
         else:
 
             # set the output
@@ -215,16 +233,12 @@ def default_tensor_shell(bval, bvec, tshell=1000):
     return oshell
 
 
-def shell_bvals(bval, b0thr=45, stol=50):
+def shell_bvals(bval, b0thr=45, stol=49):
 
-    # clustering around "centers" that get rounded?
-    # from sklearn.cluster import MeanShift, estimate_bandwidth
-    # X = np.array(zip(x,np.zeros(len(x))), dtype=np.int)
-    # bandwidth = estimate_bandwidth(X, quantile=0.1)
-    # ms = MeanShift(bandwidth=bandwidth, bin_seeding=True)
-    # ms.fit(X)
-    # labels = ms.labels_
-    # cluster_centers = ms.cluster_centers_
+    # this can be too aggressive in rounding shells w/ ##50 values
+    # bout = np.round(bval, -2)
+
+    # add a check to determine is QSI data is passed instead
 
     # sort them
     sval = np.sort(bval)
@@ -262,7 +276,7 @@ class BIDSdwi():
         self.dir_ref = False
         self.b0s = False
 
-        # paths to the files and filename
+        # path to the files and full filename
         self.dwi_path = dwi.dirname
         self.dwi_file = dwi.path
 
@@ -280,7 +294,10 @@ class BIDSdwi():
 
             # try and load the values, fail w/ error
             try:
-                self.bval = np.loadtxt(self.bval_file)
+                tbval = np.loadtxt(self.bval_file)
+                if tbval.ndim != 1:
+                    raise ValueError("bval is not a 1D array.")
+                self.bval = tbval
             except ValueError:
                 raise ValueError("bval file unable to be read.")
 
@@ -297,7 +314,12 @@ class BIDSdwi():
 
             # try and load the file, fail w/ error
             try:
-                self.bvec = np.loadtxt(self.bvec_file)
+                tbvec = np.loadtxt(self.bvec_file)
+                if tbvec.ndim != 2:
+                    raise ValueError("bvec file is not a 2D array.")
+                    if tbvec.shape[0] != 3:
+                        raise ValueError("bvec file does not have the correct number of rows.")
+                self.bvec = tbvec
             except ValueError:
                 raise ValueError("bvec file unable to be read.")
 
@@ -305,6 +327,12 @@ class BIDSdwi():
         else:
             self.bvec_file = None
             self.bvec = None
+
+        # check if bval / bvec are both not None and the same dimension
+        if (self.bval is not None) & (self.bvec is not None):
+            if (self.bval.shape[0] != self.bvec.shape[1]):
+                raise ValueError("The dimensions of the bval and bvec file do not match.")
+        # should error if only 1 is missing
 
         # determine if the file is "directed" or not
 
@@ -320,27 +348,22 @@ class BIDSdwi():
                     # it is directed
                     self.directed = True
 
+                # if there are arbitrary weighted directions
                 else:
-
-                    # if there's exactly 3, it's probably reference directions
+                    # check if there's exactly 3 - probably reference directions
                     # i.e. shell weighting on (x, y, z) axes w/ b0s
                     if np.unique(self.bvec[:, self.bval > b0thr]).shape[1] == 3:
                         self.dir_ref = True
 
                     # it's still not "directed", but it's more than empty
-                    self.directed = False
                     self.b0s = True
 
+            # bval is all 0
             else:
-
-                # bval is all 0
-                self.directed = False
                 self.b0s = True
 
+        # there's no bval / bval files
         else:
-
-            # there's no bval / bval files
-            self.directed = False
             self.b0s = True
 
         # load the data itself into the object
@@ -354,16 +377,17 @@ class BIDSdwi():
         except ValueError:
             raise ValueError("DWI file is not a valid nifti object.")
 
-        # check if the voxels are isotropic
+        # pull the voxel dimensions
         self.voxmm = np.abs(np.diag(self.dwi.affine)[:3])
 
         # check if all voxel dimensions are within a tolerance
-        if np.abs(self.voxmm[0] - self.voxmm[1]) > self.voxmm[2]*0.1 or np.abs(self.voxmm[1] - self.voxmm[2]) > self.voxmm[0]*0.1 or np.abs(self.voxmm[2] - self.voxmm[0]) > self.voxmm[1]*0.1:
+        if np.max(np.abs(np.mean(self.voxmm) - self.voxmm)) < 0.10*np.abs(np.mean(self.voxmm)):
             self.isotropic = True
         else:
             self.isotropic = False
 
         # check image affine
+        # https://community.mrtrix.org/t/mrconvert-flips-gradients/581/5
         det = np.linalg.det(self.dwi.affine)
         if det < 0:
             self.orientation = "radiological"
@@ -375,21 +399,31 @@ class BIDSdwi():
         self.aff2axcodes = nib.aff2axcodes(self.dwi.affine)
 
         # check file dimension
-        if len(self.dwi.shape) == 4:
+        if self.dwi.ndim == 4:
             self.nvol = self.dwi.shape[-1]
-        elif len(self.dwi.shape) == 3:
+        elif self.dwi.ndim == 3:
             self.nvol = 1
         else:
             raise ValueError("The DWI file does not have valid dimension(s): {self.dwi.shape}")
 
         # basic validity check of the loaded data
-        if self.bval.shape[0] != self.bvec.shape[1]:
-            raise ValueError("The dimensions of the bval and bvec file do not match.")
+        if self.bval.shape[0] != self.nvol:
+            raise ValueError("The dimensions of the bval/bvec files do not match the image.")
         else:
-            if self.bval.shape[0] != self.nvol:
-                raise ValueError("The dimensions of the bval/bvec file do not match the image.")
-            else:
-                print("All data has matching dimensions.")
+            print("All data has matching dimensions.")
+
+        # if it's a directed volume
+        if self.directed:
+
+            # parse lmax features
+            self.lmax, self.max_lmax, self.tensor_shell = bval_bvec_data(self.bval, self.bvec)
+            
+        else:
+
+            # set lmax features to none
+            self.lmax = None
+            self.max_lmax = None
+            self.tensor_shell = None
 
     @property
     def shells(self):
@@ -423,65 +457,67 @@ class BIDSdwi():
     def nb0s(self):
         return self.bval[self.bval < self.b0thr].shape[0]
 
-    @property
-    def max_lmax(self):
-        return max_lmax(self.ndirs, symmetric=True)
-
     # @property
-    # def isotropic(self):
-    #     if len(set(self.voxmm)) == 1:
-    #         return True
-    #     else:
-    #         return False
+    # def max_lmax(self):
+    #     return max_lmax(self.ndirs, symmetric=True)
 
     def get_phaseEncoding(self, notation, directed=True):
         # i/j/k to x/y/z to LR/AP/SI
 
         # pull phase encoding from sidecar
         ped = self.phaseEncoding
+        # axc = self.aff2axcodes  # is this helpful for setting dimension?
 
         # if it's undirected, drop any possible sign
         if not directed:
             ped = ped[0]
+        # this will return just x/y/z w/o sign when only encoding axis is required (TractoFlow)
 
         # if it's an ijk coordinate, just return it
         if notation == "voxel":
-            return ped
+            out = ped
 
-        # if it's an xyz coordinate, convert to mm
+        # if it's an xyz coordinate, convert to mm notation
         elif notation == "mm":
-            if ("i" in ped):
+            if "i" == ped:
                 out = "x"
-            elif ("i-" in ped):
+            elif "i-" == ped:
                 out = "x-"
-            elif ("j" in ped):
+            elif "j" == ped:
                 out = "y"
-            elif ("j-" in ped):
+            elif "j-" == ped:
                 out = "y-"
-            elif ("k" in ped):
+            elif "k" == ped:
                 print("This is probably an error.")
                 out = "z"
-            elif ("k-" in ped):
+            elif "k-" == ped:
                 print("This is probably an error.")
                 out = "z-"
+            else:
+                raise ValueError(f"Invalid phaseEncoding stored: {ped}")
 
         # if it's an axis, convert to labels
         elif notation == "axis":
-            if ("i" in ped):
-                out = "LR"
-            elif ("i-" in ped):
+            if "i" == ped:
                 out = "RL"
-            elif ("j" in ped):
-                out = "AP"
-            elif ("j-" in ped):
+            elif "i-" == ped:
+                out = "LR"
+            elif "j" == ped:
                 out = "PA"
-            elif ("k" in ped):
-                print("This is probably an error.")
-                out = "SI"
-            elif ("k-" in ped):
+            elif "j-" == ped:
+                out = "AP"
+            elif "k" == ped:
                 print("This is probably an error.")
                 out = "IS"
-        # VERIFY THAT ALL OF THESE ARE RIGHT
+            elif "k-" == ped:
+                print("This is probably an error.")
+                out = "SI"
+            else:
+                raise ValueError(f"Invalid phaseEncoding stored: {ped}")
+
+        # print a polite error for invalid return type
+        else:
+            raise ValueError("Invalid formatting requested. Options are: 'voxel', 'mm', 'axis'")
 
         return out
 
