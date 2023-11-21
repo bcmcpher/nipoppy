@@ -138,21 +138,24 @@ def max_lmax(ndirs, symmetric=True):
     return (lmax)
 
 
-def bval_bvec_data(bval, bvec, logger, zeroThr=45):
+def bval_bvec_data(bval, bvec, b0thr=45):
 
     # call the function that rounds bvals
-    rval = shell_bvals(bval, thr=zeroThr)
+    rval = shell_bvals(bval, b0thr=b0thr)
 
     # get the unique non-zero values
-    bunq = np.unique(rval)[1:]
+    bunq = np.unique(rval)
+
+    # get the default tensor shell
+    dten = default_tensor_shell(bval, bvec)
 
     # get the "theoretical" data lmax based on directions regardless of shell(s)
     dlmax = max_lmax(bvec[:, rval > 0].shape[1])
-    logger.info(f"The highest theoretical lmax in the data is {dlmax}")
+    print(f"The highest theoretical lmax in the data is {dlmax}")
 
     if len(np.unique(rval)) > 2:
 
-        logger.info(f"Multishell data has shells b = {bunq[1:]}")
+        print(f"Multishell data has shells b = {bunq[1:]}")
         mlmax = []
         mldir = []
         for shell in bunq[1:]:
@@ -169,15 +172,15 @@ def bval_bvec_data(bval, bvec, logger, zeroThr=45):
             # compute and print the maximum lmax per shell
             tlmax = max_lmax(tdir.shape[1])
             mlmax.append(tlmax)
-            logger.info(f" -- Shell b = {int(shell)} has {tdir.shape[1]} directions capable of a max lmax: {tlmax}")
-
-            # the max lmax within any 1 shell is used
-            plmax = max(mlmax)
-            logger.info(f"The maximum lmax for any one shell is: {plmax}")
+            print(f" -- Shell b = {int(shell)} has {tdir.shape[1]} directions capable of a max lmax: {tlmax}")
 
         else:
 
             plmax = max_lmax(np.sum(rval[rval > 0].shape[0]))
+
+            # the max lmax within any 1 shell is used
+        plmax = max(mlmax)
+        print(f"The maximum lmax for any one shell is: {plmax}")
 
         return (dten, plmax)
 
@@ -212,7 +215,7 @@ def default_tensor_shell(bval, bvec, tshell=1000):
     return oshell
 
 
-def shell_bvals(bval, thr=45, tol=50):
+def shell_bvals(bval, b0thr=45, stol=50):
 
     # clustering around "centers" that get rounded?
     # from sklearn.cluster import MeanShift, estimate_bandwidth
@@ -227,10 +230,10 @@ def shell_bvals(bval, thr=45, tol=50):
     sval = np.sort(bval)
 
     # zero values below threshold
-    sval[sval <= thr] = 0
+    sval[sval <= b0thr] = 0
 
     # indices into sorted values where change bigger than tolerance occurs
-    bidx = np.where(np.diff(sval) > tol)[0] + 1
+    bidx = np.where(np.diff(sval) > stol)[0] + 1
 
     # get the values that exist w/in each shell
     shell = np.split(sval, bidx)
@@ -264,8 +267,8 @@ class BIDSdwi():
         self.dwi_file = dwi.path
 
         # pull the bval / bvec files
-        cbval = layout.get_bval()
-        cbvec = layout.get_bvec()
+        cbval = layout.get_bval(dwi)
+        cbvec = layout.get_bvec(dwi)
 
         # attempt to set direction data
 
@@ -312,7 +315,7 @@ class BIDSdwi():
             if any(self.bval > b0thr):
 
                 # if there is at least a tensor model worth of directed info
-                if np.unique(self.bvec[:, self.bval > b0thr]).shape[1] >= 6:
+                if self.bvec[:, self.bval > b0thr].shape[1] >= 6:
 
                     # it is directed
                     self.directed = True
@@ -351,8 +354,25 @@ class BIDSdwi():
         except ValueError:
             raise ValueError("DWI file is not a valid nifti object.")
 
+        # check if the voxels are isotropic
+        self.voxmm = np.abs(np.diag(self.dwi.affine)[:3])
+
+        # check if all voxel dimensions are within a tolerance
+        if np.abs(self.voxmm[0] - self.voxmm[1]) > self.voxmm[2]*0.1 or np.abs(self.voxmm[1] - self.voxmm[2]) > self.voxmm[0]*0.1 or np.abs(self.voxmm[2] - self.voxmm[0]) > self.voxmm[1]*0.1:
+            self.isotropic = True
+        else:
+            self.isotropic = False
+
         # check image affine
-        # check voxel iso
+        det = np.linalg.det(self.dwi.affine)
+        if det < 0:
+            self.orientation = "radiological"
+        else:
+            warnings.warn("bvec x-axis may need to be flipped.")
+            self.orientation = "neurological"
+
+        # store axis code of the file
+        self.aff2axcodes = nib.aff2axcodes(self.dwi.affine)
 
         # check file dimension
         if len(self.dwi.shape) == 4:
@@ -403,17 +423,67 @@ class BIDSdwi():
     def nb0s(self):
         return self.bval[self.bval < self.b0thr].shape[0]
 
-    def get_phaseEncoding(self, notation="letters", directed=True):
+    @property
+    def max_lmax(self):
+        return max_lmax(self.ndirs, symmetric=True)
 
+    # @property
+    # def isotropic(self):
+    #     if len(set(self.voxmm)) == 1:
+    #         return True
+    #     else:
+    #         return False
+
+    def get_phaseEncoding(self, notation, directed=True):
         # i/j/k to x/y/z to LR/AP/SI
 
-        if ("i" in self.phaseEncoding):
-            return "x"
-        if ("j" in self.phaseEncoding):
-            return "y"
-        if ("k" in self.phaseEncoding):
-            print("This is probably an error.")
-            return "z"
+        # pull phase encoding from sidecar
+        ped = self.phaseEncoding
+
+        # if it's undirected, drop any possible sign
+        if not directed:
+            ped = ped[0]
+
+        # if it's an ijk coordinate, just return it
+        if notation == "voxel":
+            return ped
+
+        # if it's an xyz coordinate, convert to mm
+        elif notation == "mm":
+            if ("i" in ped):
+                out = "x"
+            elif ("i-" in ped):
+                out = "x-"
+            elif ("j" in ped):
+                out = "y"
+            elif ("j-" in ped):
+                out = "y-"
+            elif ("k" in ped):
+                print("This is probably an error.")
+                out = "z"
+            elif ("k-" in ped):
+                print("This is probably an error.")
+                out = "z-"
+
+        # if it's an axis, convert to labels
+        elif notation == "axis":
+            if ("i" in ped):
+                out = "LR"
+            elif ("i-" in ped):
+                out = "RL"
+            elif ("j" in ped):
+                out = "AP"
+            elif ("j-" in ped):
+                out = "PA"
+            elif ("k" in ped):
+                print("This is probably an error.")
+                out = "SI"
+            elif ("k-" in ped):
+                print("This is probably an error.")
+                out = "IS"
+        # VERIFY THAT ALL OF THESE ARE RIGHT
+
+        return out
 
 
 def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_filter=False, logger=None):
