@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import re
 import warnings
+from itertools import compress
 
 import numpy as np
 # from scipy import stats  ## for mode operation?
@@ -111,6 +112,8 @@ class BIDSSubjectSession:
 
         dwif = []
         for dwi in dwi_files:
+            print("-"*75)
+            print(f"Parsing data file: {dwi.filename}")
             dwif.append(BIDSdwi(dwi, self.layout))
 
         return dwif
@@ -197,7 +200,7 @@ def bval_bvec_data(bval, bvec, b0thr=45, stol=49, tshell=1000, symmetric=True):
         # print an equivalent output
         print(f"Single shell data has shell b = {int(shell)}")
         print(f" -- Shell b = {int(shell)} has {tdir.shape[1]} directions capable of a max lmax: {plmax}")
-        print(f"The maximum lmax for the data is: {plamx}")
+        print(f"The maximum lmax for the data is: {plmax}")
 
     return (plmax, dlmax, dten)
 
@@ -367,15 +370,15 @@ class BIDSdwi():
             self.b0s = True
 
         # load the data itself into the object
-        self.json_file = self.dwi_file.replace(".nii.gz", ".json")
         # probably a better way to get the sidecar path than this...
+        self.json_file = self.dwi_file.replace(".nii.gz", ".json")
         self.json = dwi.get_metadata()
 
         # inspect the image volume
         try:
             self.dwi = nib.load(dwi)
         except ValueError:
-            raise ValueError("DWI file is not a valid nifti object.")
+            raise ValueError("DWI file is not a valid nifti file.")
 
         # pull the voxel dimensions
         self.voxmm = np.abs(np.diag(self.dwi.affine)[:3])
@@ -385,6 +388,7 @@ class BIDSdwi():
             self.isotropic = True
         else:
             self.isotropic = False
+        # what tolerance should be used here? how can it be set by user?
 
         # check image affine
         # https://community.mrtrix.org/t/mrconvert-flips-gradients/581/5
@@ -417,7 +421,7 @@ class BIDSdwi():
 
             # parse lmax features
             self.lmax, self.max_lmax, self.tensor_shell = bval_bvec_data(self.bval, self.bvec)
-            
+
         else:
 
             # set lmax features to none
@@ -457,11 +461,7 @@ class BIDSdwi():
     def nb0s(self):
         return self.bval[self.bval < self.b0thr].shape[0]
 
-    # @property
-    # def max_lmax(self):
-    #     return max_lmax(self.ndirs, symmetric=True)
-
-    def get_phaseEncoding(self, notation, directed=True):
+    def get_phaseEncoding(self, notation="world", directed=True):
         # i/j/k to x/y/z to LR/AP/SI
 
         # pull phase encoding from sidecar
@@ -478,7 +478,7 @@ class BIDSdwi():
             out = ped
 
         # if it's an xyz coordinate, convert to mm notation
-        elif notation == "mm":
+        elif notation == "world":
             if "i" == ped:
                 out = "x"
             elif "i-" == ped:
@@ -517,9 +517,88 @@ class BIDSdwi():
 
         # print a polite error for invalid return type
         else:
-            raise ValueError("Invalid formatting requested. Options are: 'voxel', 'mm', 'axis'")
+            raise ValueError("Invalid formatting requested. Options are: 'voxel', 'world', 'axis'")
 
         return out
+
+# if any of the files are directed
+directed = [x.directed for x in zz2]
+if any(directed):
+    dfiles = list(compress(zz2, directed))
+else:
+    dfiles = []
+    print("No files with directed diffusion data.")
+
+# if any files are b0s
+b0files = [x.b0s for x in zz2]
+if any(b0files):
+    bfiles = list(compress(zz2, b0files))
+else:
+    bfiles = []
+    print("No files with only b0 data.")
+
+# get the n of directed / b0 files
+ndvols = len(dfiles)
+b0vols = len(bfiles)
+
+
+# get the phase axis and direction of directed files
+dphaseAxis = [x.phaseEncoding[0] for x in dfiles]
+dphaseDirection = [x.phaseEncoding for x in dfiles]
+
+# get the phase axis and direction of the b0 files
+bphaseAxis = [x.phaseEncoding[0] for x in bfiles]
+bphaseDirection = [x.phaseEncoding for x in bfiles]
+
+# determine the number of directed volumes
+if ndvols == 1:
+    print("There's one directed sequence. Use that.")
+    fpe_dmri = dfiles[0]
+    if b0vols > 0:
+        print("There's at least 1 b0 file to check.")
+        # pick / average together b0s of opposite phase encoding
+        # if option, extract b0s to a new file
+        rpe_dmri = bfiles[0]
+    else:
+        rpe_dmri = None
+        print("Run the single volume w/o topup.")
+
+elif ndvols == 2:
+    print("There's 2 directed sequences. Figure out if TopUp is possible.")
+    if dphaseAxis[0] == dphaseAxis[1]:
+        if dphaseDirection[0] != dphaseDirection[1]:
+            # they're opposite phase encodings - topup will happen
+            # if they have the same number of volumes you can do the average thing
+            if dfiles[0].ndirs == dfiles[1].ndirs:
+                print(" -- They have the same n directions")
+                if all(np.isclose(dfiles[0].udirs, dfiles[1].udirs)):
+                    print(" -- Sequences are mirrored and can be averaged during topup.")
+                    fpe_dmri = dfiles[0]  # order doesn't matter because they're identical
+                    rpe_dmri = dfiles[1]  # sequences in opposite phase encodings
+            else:
+                print(" -- They have different n directions")
+                # pick the larger sequence, pull b0s from the other
+                fpe_dmri = dfiles[np.argmax([x.ndirs for x in dfiles])]
+                rpe_dmri = dfiles[np.argmin([x.ndirs for x in dfiles])]
+                # if option, extract b0s to a new file
+        else:
+            print("Same phase encoding direction")
+            # they're the same phase encoding
+            # check if it's 2 single shell files that can be merged?
+            # - if directions are too close it's probably a test / retest
+            # generally this is an acquisition error
+    else:
+        print("Different encoding axes. Wierd.")
+        # both files are different encoding axis
+        # process the larger one? fail b/c that's really weird?
+
+elif ndvols > 2:
+    # probably update the filter to better target
+    print("There's more than 2 directed sequences. Split shells to merge?")
+
+else:
+    print("Failed real hard. Negative number of files found?")
+
 
 
 def parse_data(global_configs, bids_dir, participant_id, session_id, use_bids_filter=False, logger=None):
