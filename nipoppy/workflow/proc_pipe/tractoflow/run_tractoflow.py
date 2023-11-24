@@ -521,6 +521,64 @@ class BIDSdwi():
 
         return out
 
+# load test data
+global_config_file = '/home/bcmcpher/Projects/ducky/local-dev/proc/global-config.json'
+bids_dir = '/home/bcmcpher/Projects/ducky/local-dev/bids'
+participant_id = 'sub-YLOPD166'
+session_id = '01'
+use_bids_filter = True
+import logging
+
+with open(global_config_file, 'r') as f:
+    global_configs = json.load(f)
+
+# map single session files - is this overkill? probably just load from layout w/o this
+zz1 = BIDSSubjectSession(global_configs, bids_dir, participant_id, session_id, use_bids_filter, logging)
+zz2 = zz1.get_dwi_files()
+
+dphaseEncoding = [x.phaseEncoding for x in zz2]
+print(f"Phase Encoding (pe) directions of files: {dphaseEncoding}")
+
+# a list of lists of files split by phaseEncoding
+dAxes = []
+
+# split files by phase encoding
+for pe in np.unique(dphaseEncoding):
+
+    print(f"Phase Encoding: {pe}")
+
+    # get the subset of files
+    pe_files = zz2[dphaseEncoding.index(pe)]
+
+    # append a list of the files that share that property to be compared
+    dAxes.append([pe, [pe_files]])
+    print(f" -- file(s) of phase encoding = {pe}: {pe_files.dwi_file}")
+
+# for each split
+for axis in dAxes:
+    pe = axis[0]
+    dfiles = axis[1]
+    print(f"Phase Encoding {pe} has {len(dfiles)} input(s).")
+
+    # for each file in the split
+    for dfile in dfiles:
+        print(f" -- File: {dfile.dwi_file}")
+
+    # determine the best use of files
+    # - are they directed or are they b0s / references
+    # - can multiple single shell sequences be merged into a multishell one?
+    # - how many indidual b0s can be extracted? should they be?
+
+# compare phase encoding of splits
+#     if opposites:
+#         check if full mirrored sequences for topup
+#         or determine the "best" fpe / rpe combination
+#         - may need to write new files for ease of use?
+#     elif the-same:
+#         flag as test/retest or possible acquisition error
+#     else
+#         can't be usefully combined
+
 # if any of the files are directed
 directed = [x.directed for x in zz2]
 if any(directed):
@@ -541,7 +599,6 @@ else:
 ndvols = len(dfiles)
 b0vols = len(bfiles)
 
-
 # get the phase axis and direction of directed files
 dphaseAxis = [x.phaseEncoding[0] for x in dfiles]
 dphaseDirection = [x.phaseEncoding for x in dfiles]
@@ -550,7 +607,7 @@ dphaseDirection = [x.phaseEncoding for x in dfiles]
 bphaseAxis = [x.phaseEncoding[0] for x in bfiles]
 bphaseDirection = [x.phaseEncoding for x in bfiles]
 
-# determine the number of directed volumes
+# based on the number of directed volumes
 if ndvols == 1:
     print("There's one directed sequence. Use that.")
     fpe_dmri = dfiles[0]
@@ -582,7 +639,7 @@ elif ndvols == 2:
                 rpe_dmri = dfiles[np.argmin([x.ndirs for x in dfiles])]
                 # if option, extract b0s to a new file
         else:
-            print("Same phase encoding direction")
+            print("Same phase encoding direction.")
             # they're the same phase encoding
             # check if it's 2 single shell files that can be merged?
             # - if directions are too close it's probably a test / retest
