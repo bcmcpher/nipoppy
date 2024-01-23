@@ -108,15 +108,55 @@ class BIDSSubjectSession:
 
     def get_dwi_files(self):
 
+        # get the dwi volumes from layout
         dwi_files = self.get_modality_volumes("dwi")
 
+        # for every dwi, put them in a list of DWI objects
         dwif = []
         for dwi in dwi_files:
             print("-"*75)
             print(f"Parsing data file: {dwi.filename}")
             dwif.append(BIDSdwi(dwi, self.layout))
 
-        return dwif
+        # get the diffusion phase encoding from the DWI objects
+        dphaseEncoding = [x.phaseEncoding for x in dwif]
+        print("-"*75)
+        print("-"*75)
+        print("Parsing Phase Encoding (PE) directions...")
+        print(f" -- Identified phase encodings (PE): {dphaseEncoding}")
+
+        # a list of lists of files split by phaseEncoding
+        dAxes = []
+
+        # split files by phaseEncoding axis
+        for pe in np.unique(dphaseEncoding):
+
+            print("-"*75)
+            print(f"Phase Encoding: {pe}")
+
+            # catch the index to store the same entries
+            pe_idx = dphaseEncoding.index(pe)
+
+            # get the subset of files
+            pe_files = dwif[pe_idx]
+
+            # catch which ones are directed
+            if type(pe_files) is not list:
+                pe_dir = [pe_files.directed]
+            else:
+                pe_dir = [x.directed for x in pe_files]
+
+            # catch which ones are b0s
+            if type(pe_files) is not list:
+                pe_b0s = [pe_files.b0s]
+            else:
+                pe_b0s = [x.b0s for x in pe_files]
+
+            # append a list of the files that share that property to be compared
+            dAxes.append([pe, pe_dir, pe_b0s, [pe_files]])
+            print(f" -- file(s) of phase encoding = {pe}: {os.path.basename(pe_files.dwi_file)}")
+
+        return dAxes
 
 
 def max_lmax(ndirs, symmetric=True):
@@ -300,7 +340,10 @@ class BIDSdwi():
                 tbval = np.loadtxt(self.bval_file)
                 if tbval.ndim != 1:
                     raise ValueError("bval is not a 1D array.")
-                self.bval = tbval
+                else:
+                    if ~any(tbval) < b0thr:
+                        warnings.warn("File has no b0 observations. May cause a problem.")
+                    self.bval = tbval
             except ValueError:
                 raise ValueError("bval file unable to be read.")
 
@@ -546,7 +589,7 @@ dAxes = []
 # split files by phaseEncoding axis
 for pe in np.unique(dphaseEncoding):
 
-    #print(f"Phase Encoding: {pe}")
+    print(f"Phase Encoding: {pe}")
 
     # catch the index to store the same entries
     pe_idx = dphaseEncoding.index(pe)
@@ -568,7 +611,7 @@ for pe in np.unique(dphaseEncoding):
 
     # append a list of the files that share that property to be compared
     dAxes.append([pe, pe_dir, pe_b0s, [pe_files]])
-    #print(f" -- file(s) of phase encoding = {pe}: {os.path.basename(pe_files.dwi_file)}")
+    print(f" -- file(s) of phase encoding = {pe}: {os.path.basename(pe_files.dwi_file)}")
 
 # for each phaseEncoding axis
 for axis in dAxes:
@@ -587,41 +630,57 @@ for axis in dAxes:
     print(f" -- N Directed Volumes: {np.sum(ipe_dir)}")
     print(f" -- N B0 Volumes: {np.sum(ipe_b0s)}")
 
-    # # for each file in the split
-    # for dfile in idfiles:
-    #     print(f" -- File: {os.path.basename(dfile.dwi_file)}")
-
-    #     # print the phaseEncoding if it's directed
-    #     if dfile.directed:
-    #         print(" --  -- File is directed.")
-    #     elif dfile.b0s | dfile.dir_ref:
-    #         print(" --  -- File is not directed.")
-    #     else:
-    #         raise ValueError("dfile is incorrectly loaded. Cannot deterermine phase encoding.")
-
     # if the pe has 1 directed volume and no extra b0s
     if (n_ipe_dir == 1) & (n_ipe_b0s == 0):
         print(" --  -- Found 1 directed volume.")
         # pass the volume as output
+
+    # if the pe has 0 directed volumes 1 b0 volume(s)
+    elif (n_ipe_dir == 0) & (n_ipe_b0s > 0):
+        print(" --  -- Found 1 b0 volume.")
+        # pass the volume as output
+
     # if the pe has 0 directed volumes and at least 1 b0 volume(s)
     elif (n_ipe_dir == 0) & (n_ipe_b0s > 0):
         print(" --  -- Found 1 or more b0s volume(s).")
         # check and merge the b0s together
+
     # if the pe has 1 directed volume and extra b0s
     elif (n_ipe_dir == 1) & (n_ipe_b0s > 0):
         print(" --  -- Found 1 directed volume and additional b0 volume(s).")
         # check option to merge b0s and pass new volume as output
+
     # if the pe has multiple directed volumes and no extra b0s
     elif (n_ipe_dir > 1) & (n_ipe_b0s == 0):
         print(" --  -- Found 2 or more directed volumes. Check shells / directions and merge.")
         n_ipe_vols = [x.ndirs for x in idfiles]  # grab the number of directions - if ambiguous, pick the larger one
         # check that shells / dimensions aren't duplicates, then optionally merge and pass as output.
+
     # if the pe has multiple directed volumes and extra b0s
     elif (n_ipe_dir > 1) & (n_ipe_b0s > 0):
         print(" --  -- Found 2 or more directed volumes and additional b0 volume(s). Check shells / directions and merge.")
         # check that shells / dimensions aren't duplicates, optionally merge b0s and directions and pass as output.
+
+    # fail over
     else:
         raise ValueError("Somehow found inadequate files for a phaseEncoding that has files.")
+
+
+def mergeDwiPeVolumes(invols):
+
+    # load the image blocks / bvecs
+    imgs_data = [nib.load(x.dwi_file).get_fdata() for x in invols]
+    imgs_shape = [x.shape[:3] for x in imgs_data]
+    bvec_data = [x.bvec for x in invols]
+
+    # determine bvec distances from one another w/in a tolerance?
+
+    # check that the 3D image dimensions match
+    if len(set(imgs_shape)) > 1:
+        warnings.warn("The image dimensions for this phase encoding do not match.")
+        # fail gracefully?
+        # pick the largest, directed file?
+
 
 # TODO : WRITE A FUNCTION TO MERGE DWI SEQUENCES
 #        - CHECK IMAGE VOLUME DIMENSIONS THAT THEY CAN BE COMBINED
